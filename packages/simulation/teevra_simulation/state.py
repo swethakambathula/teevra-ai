@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from teevra_shared_schemas import (
@@ -40,6 +40,8 @@ class LocalState:
         self.audit: list[dict] = []
         self.worker_roles: dict[str, str] = {}
         self.candidate_version_id: Optional[str] = None
+        self.worker_heat_status: dict[str, HeatStatus] = {}
+        self.worker_machinery_disabled_until: dict[str, datetime] = {}
 
     async def lock(self):
         return self._lock

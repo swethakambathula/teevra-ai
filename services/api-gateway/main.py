@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
@@ -19,7 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
 
-from teevra_shared_schemas import Severity
+from teevra_shared_schemas import Severity, HeatStatus
 from teevra_simulation import (
     MACHINES, JOBS, WORKERS, TOTAL_SLOTS, FROZEN_WINDOW_SLOTS, DEMO_START,
     slot_to_ist, ist_to_slot, HEAT_POLICY, WORKSTATIONS, tariff_rate_at_ist,
@@ -619,6 +619,160 @@ async def checkin_status(worker_id: Optional[str] = None, role: str = Depends(cu
     state = get_state()
     items = [c for c in state.checkins if not worker_id or c.worker_id == worker_id]
     return {"status": "ok", "checkins": [c.model_dump() for c in items], "count": len(items)}
+
+
+# --------------------------------------------------------------------------- #
+# Heat Stress Guardian: Three-Tier Worker Check-In + Machinery Restriction
+# --------------------------------------------------------------------------- #
+
+def _workers_on_machine(state, machine_id: str) -> list[str]:
+    """Return worker IDs currently assigned to a machine in the active schedule."""
+    vid = state.current_version_id
+    version = state.schedules.get(vid) if vid else None
+    if not version:
+        return []
+    workers = set()
+    for e in version.entries:
+        if e.machine_id == machine_id and e.worker_id:
+            workers.add(e.worker_id)
+    return list(workers)
+
+
+def _is_machinery_disabled(state, worker_id: str) -> tuple[bool, Optional[datetime]]:
+    """Check if a worker is currently restricted from machinery."""
+    until = state.worker_machinery_disabled_until.get(worker_id)
+    if until is None:
+        return False, None
+    if datetime.now(timezone.utc) > until:
+        del state.worker_machinery_disabled_until[worker_id]
+        return False, None
+    return True, until
+
+
+@app.post("/api/worker/heat-checkin")
+async def worker_heat_checkin(payload: dict, role: str = Depends(current_role)):
+    """Three-tier heat stress check-in for workers assigned to a machine/workstation.
+
+    Tier 1 - OK: worker is fine, no restriction.
+    Tier 2 - TOO_HOT (caution): worker must rest 15 min; machinery disabled for 15 min.
+    Tier 3 - SOS: CRITICAL supervisor alert raised immediately.
+    """
+    state = get_state()
+    from teevra_shared_schemas.heat import CheckIn, CheckInResponse, SupervisorAlert
+
+    worker_id = payload.get("worker_id")
+    workstation_id = payload.get("workstation_id", "WS-CNC-A")
+    response = payload.get("response", "OK")
+    language = payload.get("language", "en")
+    voice_consent = bool(payload.get("voice_consent", False))
+
+    if response not in {r.value for r in CheckInResponse}:
+        raise HTTPException(status_code=400, detail=f"invalid response: {response}")
+
+    # Record the check-in
+    checkin = CheckIn(
+        checkin_id=f"ci-{uuid.uuid4().hex[:8]}",
+        worker_id=worker_id,
+        workstation_id=workstation_id,
+        language=language,
+        response=CheckInResponse(response),
+        voice_consent=voice_consent,
+        responded_at=datetime.now(timezone.utc).isoformat(),
+        reminder_sent_at=datetime.now(timezone.utc).isoformat(),
+    )
+    state.checkins.append(checkin)
+
+    result = {
+        "status": "ok",
+        "checkin_id": checkin.checkin_id,
+        "worker_id": worker_id,
+        "workstation_id": workstation_id,
+        "response": response,
+        "tier": response,
+        "machinery_disabled": False,
+        "disabled_until": None,
+        "alert_created": False,
+    }
+
+    if response == CheckInResponse.OK:
+        state.worker_heat_status[worker_id] = HeatStatus.NORMAL
+        result["guidance"] = "You are fine. Continue working."
+
+    elif response == CheckInResponse.TOO_HOT:
+        # Tier 2: Rest 15 min, disable machinery for 15 minutes
+        disabled_until = datetime.now(timezone.utc) + timedelta(minutes=15)
+        state.worker_machinery_disabled_until[worker_id] = disabled_until
+        state.worker_heat_status[worker_id] = HeatStatus.HIGH_RISK
+        result["machinery_disabled"] = True
+        result["disabled_until"] = disabled_until.isoformat()
+        result["guidance"] = "Too hot. Take rest for 15 minutes, then continue. You cannot use machinery for 15 minutes."
+
+        # Create supervisor alert (MEDIUM severity)
+        alert = SupervisorAlert(
+            alert_id=f"alert-{uuid.uuid4().hex[:8]}",
+            alert_type="WORKER_HEAT_CAUTION",
+            severity="MEDIUM",
+            workstation_id=workstation_id,
+            worker_id=worker_id,
+            message=f"Worker {worker_id} reported TOO_HOT at {workstation_id}. Machinery restricted for 15 minutes.",
+            correlation_id=payload.get("correlation_id"),
+        )
+        state.alerts[alert.alert_id] = alert
+        result["alert_created"] = True
+        result["alert_id"] = alert.alert_id
+
+        await HUB.publish({
+            "type": "worker.heat_caution",
+            "payload": result,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    elif response == CheckInResponse.SOS:
+        # Tier 3: CRITICAL supervisor alert
+        state.worker_heat_status[worker_id] = HeatStatus.STOP_WORK
+        alert = SupervisorAlert(
+            alert_id=f"alert-{uuid.uuid4().hex[:8]}",
+            alert_type="WORKER_SOS",
+            severity="CRITICAL",
+            workstation_id=workstation_id,
+            worker_id=worker_id,
+            message=f"SOS from worker {worker_id} at {workstation_id}. Immediate assistance required.",
+            correlation_id=payload.get("correlation_id"),
+        )
+        state.alerts[alert.alert_id] = alert
+        result["machinery_disabled"] = True
+        result["disabled_until"] = None
+        result["guidance"] = "SOS. Stay where you are. Help is being dispatched."
+        result["alert_created"] = True
+        result["alert_id"] = alert.alert_id
+
+        await HUB.publish({
+            "type": "worker.sos",
+            "payload": alert.model_dump(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    await HUB.publish({
+        "type": "worker.heat_checkin",
+        "payload": result,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    return result
+
+
+@app.get("/api/worker/heat-status/{worker_id}")
+async def worker_heat_status(worker_id: str, role: str = Depends(current_role)):
+    """Return a worker's current heat status and machinery restriction state."""
+    state = get_state()
+    disabled, until = _is_machinery_disabled(state, worker_id)
+    risk = state.worker_heat_status.get(worker_id, HeatStatus.NORMAL)
+    return {
+        "status": "ok",
+        "worker_id": worker_id,
+        "heat_status": risk.value,
+        "machinery_disabled": disabled,
+        "disabled_until": until.isoformat() if until else None,
+    }
 
 
 # --------------------------------------------------------------------------- #
